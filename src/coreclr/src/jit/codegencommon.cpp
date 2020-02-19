@@ -6308,71 +6308,120 @@ void CodeGen::genZeroInitFrame(int untrLclHi, int untrLclLo, regNumber initReg, 
         noway_assert(uCntBytes == 0);
 
 #elif defined(TARGET_XARCH)
-        /*
-            Generate the following code:
-
-                lea     edi, [ebp/esp-OFFS]
-                mov     ecx, <size>
-                xor     eax, eax
-                rep     stosd
-         */
-
-        noway_assert(regSet.rsRegsModified(RBM_EDI));
-
+        assert(compiler->getSIMDSupportLevel() >= SIMD_SSE2_Supported);
+// Zero out the whole thing rounded up to a single stack slot size
+// Grab a non-argument, non-callee saved XMM reg
 #ifdef UNIX_AMD64_ABI
-        // For register arguments we may have to save ECX and RDI on Amd64 System V OSes
-        if (intRegState.rsCalleeRegArgMaskLiveIn & RBM_RCX)
+        // System V x64 first temp reg is xmm8
+        regNumber zeroSIMDReg = genRegNumFromMask(RBM_XMM8);
+#else
+        // Windows first temp reg is xmm4
+        regNumber zeroSIMDReg = genRegNumFromMask(RBM_XMM4);
+#endif // UNIX_AMD64_ABI
+        unsigned  blkSize     = roundUp((untrLclHi - untrLclLo), (unsigned)sizeof(int));
+        // The loop is unrolled 3 times so we do not move to the loop block until it
+        // will loop at least once, so the threshold is set at 6.
+        unsigned loopThreshold = 6 * XMM_REGSIZE_BYTES;
+        if (blkSize < loopThreshold)
         {
-            noway_assert(regSet.rsRegsModified(RBM_R12));
-            inst_RV_RV(INS_mov, REG_R12, REG_RCX);
-            regSet.verifyRegUsed(REG_R12);
-        }
+            // Generate the following code:
+            //
+            //   xor      rax, rax
+            //   vxorps   xmm4, xmm4
+            //   vmovups  xmmword ptr [ebp/esp-OFFS], xmm4
+            //   ...
+            //   vmovups  xmmword ptr [ebp/esp-OFFS], xmm4
+            //   mov      qword ptr [ebp/esp-OFFS], rax
 
-        if (intRegState.rsCalleeRegArgMaskLiveIn & RBM_RDI)
+            unsigned  i        = 0;
+            emitter*  emit     = GetEmitter();
+            regNumber frameReg = genFramePointerReg();
+            regNumber zeroReg  = REG_NA;
+            if (blkSize >= XMM_REGSIZE_BYTES)
+            {
+                emit->emitIns_R_R(INS_xorps, EA_16BYTE, zeroSIMDReg, zeroSIMDReg);
+            }
+            if ((blkSize % XMM_REGSIZE_BYTES) != 0)
+            {
+                assert((genRegMask(initReg) & intRegState.rsCalleeRegArgMaskLiveIn) == 0); // initReg is not a live
+                                                                                           // incoming argument reg
+                zeroReg = genGetZeroReg(initReg, pInitRegZeroed);
+            }
+            for (unsigned regSize = XMM_REGSIZE_BYTES; i + regSize <= blkSize; i += regSize)
+            {
+                emit->emitIns_AR_R(INS_movups, EA_ATTR(regSize), zeroSIMDReg, frameReg, untrLclLo + i);
+            }
+            for (; i + REGSIZE_BYTES <= blkSize; i += REGSIZE_BYTES)
+            {
+                noway_assert((blkSize % XMM_REGSIZE_BYTES) != 0);
+                emit->emitIns_AR_R(ins_Store(TYP_I_IMPL), EA_PTRSIZE, zeroReg, frameReg, untrLclLo + i);
+            }
+#ifdef TARGET_64BIT
+            assert(i == blkSize || (i + sizeof(int) == blkSize));
+            if (i != blkSize)
+            {
+                noway_assert((blkSize % XMM_REGSIZE_BYTES) != 0);
+                emit->emitIns_AR_R(ins_Store(TYP_INT), EA_4BYTE, zeroReg, frameReg, untrLclLo + i);
+                i += sizeof(int);
+            }
+#endif // TARGET_64BIT
+            assert(i == blkSize);
+        }
+        else
         {
-            noway_assert(regSet.rsRegsModified(RBM_R13));
-            inst_RV_RV(INS_mov, REG_R13, REG_RDI);
-            regSet.verifyRegUsed(REG_R13);
+            // Generate the following code:
+            //
+            //    xorps    xmm4, xmm4
+            //    ;movups xmmword ptr[ebp/esp-HiOFFS - 10H], xmm4  ; if not multiple of xmm chunks
+            //    ; + 2 x if not multple of 3 xmm chunks
+            //    mov rax, - <size>                                ; start offset from hi
+            //    movups xmmword ptr[rbp + rax + OFFS      ], xmm4 ; <--+
+            //    movups xmmword ptr[rbp + rax + OFFS + 10H], xmm4 ;    |
+            //    movups xmmword ptr[rbp + rax + OFFS + 20H], xmm4 ;    | Loop
+            //    add rax, 48                                      ;    |
+            //    jne SHORT  -5 instr                              ; ---+
+
+            emitter* emit = GetEmitter();
+
+            regNumber frameReg            = genFramePointerReg();
+            int       simdBlockSize       = XMM_REGSIZE_BYTES * (blkSize / XMM_REGSIZE_BYTES);
+            int       simdTripleBlockSize = XMM_REGSIZE_BYTES * 3 * (blkSize / (3 * XMM_REGSIZE_BYTES));
+            emit->emitIns_R_I(INS_mov, EA_PTRSIZE, REG_EAX, -simdTripleBlockSize);
+
+            emit->emitIns_R_R(INS_xorps, EA_16BYTE, zeroSIMDReg, zeroSIMDReg);
+
+            if ((blkSize % XMM_REGSIZE_BYTES) != 0)
+            {
+                // Not multple of simd, add a store at end of block which overlaps
+                emit->emitIns_AR_R(INS_movups, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg,
+                                   untrLclHi - XMM_REGSIZE_BYTES);
+            }
+
+            // Remove the non-simd from the offset
+            int offset = untrLclHi & -XMM_REGSIZE_BYTES;
+            if ((simdBlockSize % (XMM_REGSIZE_BYTES * 3)) != 0)
+            {
+                // Not a multiple of 3 so add extra stores at end of block
+                emit->emitIns_AR_R(INS_movups, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg,
+                                   offset - simdBlockSize);
+                if (((simdBlockSize - XMM_REGSIZE_BYTES * 2) % (XMM_REGSIZE_BYTES * 3)) == 0)
+                {
+                    // If removing 2 x simd makes it a multiple of 3, an extra 2 are needed
+                    emit->emitIns_AR_R(INS_movups, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg,
+                                       offset - simdBlockSize - XMM_REGSIZE_BYTES);
+                }
+            }
+
+            emit->emitIns_ARX_R(INS_movups, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg, REG_EAX, 1, offset);
+            emit->emitIns_ARX_R(INS_movups, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg, REG_EAX, 1,
+                                offset + XMM_REGSIZE_BYTES);
+            emit->emitIns_ARX_R(INS_movups, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg, REG_EAX, 1,
+                                offset + XMM_REGSIZE_BYTES * 2);
+
+            emit->emitIns_R_I(INS_add, EA_PTRSIZE, REG_EAX, XMM_REGSIZE_BYTES * 3);
+            emit->emitIns_J(INS_jne, NULL, -5);
         }
-#else  // !UNIX_AMD64_ABI
-        // For register arguments we may have to save ECX
-        if (intRegState.rsCalleeRegArgMaskLiveIn & RBM_ECX)
-        {
-            noway_assert(regSet.rsRegsModified(RBM_ESI));
-            inst_RV_RV(INS_mov, REG_ESI, REG_ECX);
-            regSet.verifyRegUsed(REG_ESI);
-        }
-#endif // !UNIX_AMD64_ABI
-
-        noway_assert((intRegState.rsCalleeRegArgMaskLiveIn & RBM_EAX) == 0);
-
-        GetEmitter()->emitIns_R_AR(INS_lea, EA_PTRSIZE, REG_EDI, genFramePointerReg(), untrLclLo);
-        regSet.verifyRegUsed(REG_EDI);
-
-        inst_RV_IV(INS_mov, REG_ECX, (untrLclHi - untrLclLo) / sizeof(int), EA_4BYTE);
-        instGen_Set_Reg_To_Zero(EA_PTRSIZE, REG_EAX);
-        instGen(INS_r_stosd);
-
-#ifdef UNIX_AMD64_ABI
-        // Move back the argument registers
-        if (intRegState.rsCalleeRegArgMaskLiveIn & RBM_RCX)
-        {
-            inst_RV_RV(INS_mov, REG_RCX, REG_R12);
-        }
-
-        if (intRegState.rsCalleeRegArgMaskLiveIn & RBM_RDI)
-        {
-            inst_RV_RV(INS_mov, REG_RDI, REG_R13);
-        }
-#else  // !UNIX_AMD64_ABI
-        // Move back the argument registers
-        if (intRegState.rsCalleeRegArgMaskLiveIn & RBM_ECX)
-        {
-            inst_RV_RV(INS_mov, REG_ECX, REG_ESI);
-        }
-#endif // !UNIX_AMD64_ABI
-
-#else // TARGET*
+#else  // TARGET*
 #error Unsupported or unset target architecture
 #endif // TARGET*
     }
