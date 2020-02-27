@@ -6447,9 +6447,9 @@ void CodeGen::genZeroInitFrame(int untrLclHi, int untrLclLo, regNumber initReg, 
 
             assert((blkSize + alignmentHiBlkSize) == (untrLclHi - untrLclLo));
 #endif
-            // The loop is unrolled 3 times so we do not move to the loop block until it
-            // will loop at least once so the threshold is 6.
-            if (blkSize < 6 * XMM_REGSIZE_BYTES)
+            // The loop is unrolled 2 times so we do not move to the loop block until it
+            // will loop at least once so the threshold is 4.
+            if (blkSize < 4 * XMM_REGSIZE_BYTES)
             {
                 // Generate the following code:
                 //
@@ -6478,39 +6478,31 @@ void CodeGen::genZeroInitFrame(int untrLclHi, int untrLclLo, regNumber initReg, 
                 //    ;movaps xmmword ptr[ebp/esp-loOFFS + 10H], xmm4    ;
                 //    mov rax, - <size>                                  ; start offset from hi
                 //    movaps xmmword ptr[rbp + rax + hiOFFS      ], xmm4 ; <--+
-                //    movaps xmmword ptr[rbp + rax + hiOFFS + 10H], xmm4 ;    |
-                //    movaps xmmword ptr[rbp + rax + hiOFFS + 20H], xmm4 ;    | Loop
-                //    add rax, 48                                        ;    |
-                //    jne SHORT  -5 instr                                ; ---+
+                //    movaps xmmword ptr[rbp + rax + hiOFFS + 10H], xmm4 ;    | Loop
+                //    add rax, 32                                        ;    |
+                //    jne SHORT  -4 instr                                ; ---+
 
                 emit->emitIns_R_R(INS_xorps, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, zeroSIMDReg);
 
                 // How many extra don't fit into the 3x unroll
-                int extraSimd = (blkSize % (XMM_REGSIZE_BYTES * 3)) / XMM_REGSIZE_BYTES;
+                int extraSimd = (blkSize % (XMM_REGSIZE_BYTES * 2)) / XMM_REGSIZE_BYTES;
                 if (extraSimd != 0)
                 {
                     blkSize -= XMM_REGSIZE_BYTES;
                     // Not a multiple of 3 so add extra stores at end of block
                     emit->emitIns_AR_R(simdMov, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg, alignedLclLo);
-                    if (extraSimd == 2)
-                    {
-                        blkSize -= XMM_REGSIZE_BYTES;
-                        // If removing 2 x simd makes it a multiple of 3, an extra 2 are needed
-                        emit->emitIns_AR_R(simdMov, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg,
-                                           alignedLclLo + XMM_REGSIZE_BYTES);
-                    }
                 }
 
                 // Exact multiple of 3 simd lengths (or loop end condition will not be met)
-                noway_assert((blkSize % (3 * XMM_REGSIZE_BYTES)) == 0);
+                noway_assert((blkSize % (2 * XMM_REGSIZE_BYTES)) == 0);
 
                 // At least 6 simd lengths remain (as loop is 3x unrolled and we want it to loop at least once)
-                assert(blkSize >= (3 * XMM_REGSIZE_BYTES));
+                assert(blkSize >= (2 * XMM_REGSIZE_BYTES));
                 // In range at start of loop
                 assert((alignedLclHi - blkSize) >= untrLclLo);
-                assert(((alignedLclHi - blkSize) + (XMM_REGSIZE_BYTES * 2)) < (untrLclHi - XMM_REGSIZE_BYTES));
+                assert(((alignedLclHi - blkSize) + (XMM_REGSIZE_BYTES * 1)) < (untrLclHi - XMM_REGSIZE_BYTES));
                 // In range at end of loop
-                assert((alignedLclHi - (3 * XMM_REGSIZE_BYTES) + (2 * XMM_REGSIZE_BYTES)) <=
+                assert((alignedLclHi - (2 * XMM_REGSIZE_BYTES) + (1 * XMM_REGSIZE_BYTES)) <=
                        (untrLclHi - XMM_REGSIZE_BYTES));
                 assert((alignedLclHi - (blkSize + extraSimd * XMM_REGSIZE_BYTES)) == alignedLclLo);
 
@@ -6521,12 +6513,10 @@ void CodeGen::genZeroInitFrame(int untrLclHi, int untrLclLo, regNumber initReg, 
                                     alignedLclHi);
                 emit->emitIns_ARX_R(simdMov, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg, initReg, 1,
                                     alignedLclHi + XMM_REGSIZE_BYTES);
-                emit->emitIns_ARX_R(simdMov, EA_ATTR(XMM_REGSIZE_BYTES), zeroSIMDReg, frameReg, initReg, 1,
-                                    alignedLclHi + 2 * XMM_REGSIZE_BYTES);
 
-                emit->emitIns_R_I(INS_add, EA_PTRSIZE, initReg, XMM_REGSIZE_BYTES * 3);
+                emit->emitIns_R_I(INS_add, EA_PTRSIZE, initReg, XMM_REGSIZE_BYTES * 2);
                 // Loop until counter is 0
-                emit->emitIns_J(INS_jne, nullptr, -5);
+                emit->emitIns_J(INS_jne, nullptr, -4);
 
                 // initReg will be zero at end of the loop
                 *pInitRegZeroed = true;
