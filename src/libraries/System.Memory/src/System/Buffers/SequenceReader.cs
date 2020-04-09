@@ -315,7 +315,7 @@ namespace System.Buffers
             if ((count & TooBigOrNegative) == 0 && CurrentSpan.Length - CurrentSpanIndex > (int)count)
             {
                 CurrentSpanIndex += (int)count;
-                Consumed += count;
+                Consumed += (int)count;
             }
             else
             {
