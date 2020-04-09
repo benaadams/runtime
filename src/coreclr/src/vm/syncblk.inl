@@ -714,32 +714,34 @@ FORCEINLINE AwareLock::LeaveHelperAction ObjHeader::LeaveObjMonitorHelper(Thread
 
     if ((syncBlockValue & (BIT_SBLK_SPIN_LOCK + BIT_SBLK_IS_HASH_OR_SYNCBLKINDEX)) == 0)
     {
-        if ((syncBlockValue & SBLK_MASK_LOCK_THREADID) != pCurThread->GetThreadId())
+        if ((syncBlockValue & SBLK_MASK_LOCK_THREADID) == pCurThread->GetThreadId())
+        {
+            if (!(syncBlockValue & SBLK_MASK_LOCK_RECLEVEL))
+            {
+                // We are leaving the lock
+                DWORD newValue = (syncBlockValue & (~SBLK_MASK_LOCK_THREADID));
+                if (InterlockedCompareExchangeRelease((LONG*)&m_SyncBlockValue, newValue, syncBlockValue) == (LONG)syncBlockValue)
+                {
+                    return AwareLock::LeaveHelperAction_None;
+                }
+            }
+            else
+            {
+                // recursion and ThinLock
+                DWORD newValue = syncBlockValue - SBLK_LOCK_RECLEVEL_INC;
+                if (InterlockedCompareExchangeRelease((LONG*)&m_SyncBlockValue, newValue, syncBlockValue) == (LONG)syncBlockValue)
+                {
+                    return AwareLock::LeaveHelperAction_None;
+                }
+            }
+        }
+        else
         {
             // This thread does not own the lock.
             return AwareLock::LeaveHelperAction_Error;
         }
 
-        if (!(syncBlockValue & SBLK_MASK_LOCK_RECLEVEL))
-        {
-            // We are leaving the lock
-            DWORD newValue = (syncBlockValue & (~SBLK_MASK_LOCK_THREADID));
-            if (InterlockedCompareExchangeRelease((LONG*)&m_SyncBlockValue, newValue, syncBlockValue) != (LONG)syncBlockValue)
-            {
-                return AwareLock::LeaveHelperAction_Yield;
-            }
-        }
-        else
-        {
-            // recursion and ThinLock
-            DWORD newValue = syncBlockValue - SBLK_LOCK_RECLEVEL_INC;
-            if (InterlockedCompareExchangeRelease((LONG*)&m_SyncBlockValue, newValue, syncBlockValue) != (LONG)syncBlockValue)
-            {
-                return AwareLock::LeaveHelperAction_Yield;
-            }
-        }
-
-        return AwareLock::LeaveHelperAction_None;
+        return AwareLock::LeaveHelperAction_Yield;
     }
 
     if ((syncBlockValue & (BIT_SBLK_SPIN_LOCK + BIT_SBLK_IS_HASHCODE)) == 0)
