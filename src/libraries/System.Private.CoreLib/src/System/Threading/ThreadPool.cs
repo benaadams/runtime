@@ -30,16 +30,25 @@ namespace System.Threading
         public static readonly ThreadPoolWorkQueue workQueue = new ThreadPoolWorkQueue();
 
         /// <summary>Shim used to invoke <see cref="IAsyncStateMachineBox.MoveNext"/> of the supplied <see cref="IAsyncStateMachineBox"/>.</summary>
-        internal static readonly Action<object?> s_invokeAsyncStateMachineBox = state =>
-        {
-            if (!(state is IAsyncStateMachineBox box))
-            {
-                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.state);
-                return;
-            }
+        internal static readonly Action<object?> s_invokeAsyncStateMachineBox = new Action<object?>(Invoke.Instance.AsyncStateMachineBox);
 
-            box.MoveNext();
-        };
+        // Class rather than lambda for intelligible stack trace.
+        private class Invoke
+        {
+            public static readonly Invoke Instance = new Invoke();
+
+            // Invoking an instance delegate is faster than a static delegate (as it needs to shim the `this` pointer)
+            public void AsyncStateMachineBox(object? state)
+            {
+                if (!(state is IAsyncStateMachineBox box))
+                {
+                    ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.state);
+                    return;
+                }
+
+                box.MoveNext();
+            }
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)] // enforce layout so that padding reduces false sharing

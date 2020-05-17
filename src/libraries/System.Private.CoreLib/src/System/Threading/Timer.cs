@@ -5,6 +5,7 @@
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.Tracing;
+using System.Runtime.ExceptionServices;
 using System.Threading.Tasks;
 
 namespace System.Threading
@@ -640,9 +641,37 @@ namespace System.Threading
                         ExecutionContext.RunForThreadPoolUnsafe(context, s_callCallbackInContext, this);
                     }
                 }
-                else
+                else if (!context.IsDefault)
                 {
                     ExecutionContext.RunInternal(context, s_callCallbackInContext, this);
+                }
+                else
+                {
+                    Thread currentThread = Thread.CurrentThread;
+                    ExecutionContext? currentContext = currentThread._executionContext;
+
+                    if (currentContext != null && !currentContext.IsDefault)
+                    {
+                        // Current thread is not on Default
+                        ExecutionContext.RunOnDefaultContext(currentThread, currentContext, s_callCallbackInContext, this);
+                    }
+                    else
+                    {
+                        // On Default and to run on Default; however we need to undo any changes that happen in call.
+                        SynchronizationContext? previousSyncCtx = currentThread._synchronizationContext;
+                        ExceptionDispatchInfo? edi = null;
+                        try
+                        {
+                            // Run directly
+                            _timerCallback(_state);
+                        }
+                        catch (Exception ex)
+                        {
+                            edi = ExceptionDispatchInfo.Capture(ex);
+                        }
+
+                        ExecutionContext.RestoreDefaultContext(currentThread, previousSyncCtx, edi);
+                    }
                 }
             }
         }

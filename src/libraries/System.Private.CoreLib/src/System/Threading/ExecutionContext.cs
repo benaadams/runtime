@@ -54,18 +54,26 @@ namespace System.Threading
         }
 
         public static ExecutionContext? Capture()
+            => Capture(Thread.CurrentThread);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static ExecutionContext? Capture(Thread currentThread)
         {
-            ExecutionContext? executionContext = Thread.CurrentThread._executionContext;
-            if (executionContext == null)
+            Debug.Assert(currentThread == Thread.CurrentThread);
+
+            ExecutionContext? executionContext = currentThread._executionContext;
+            if (executionContext is null)
             {
-                executionContext = Default;
+                return Default;
             }
             else if (executionContext.m_isFlowSuppressed)
             {
-                executionContext = null;
+                return null;
             }
-
-            return executionContext;
+            else
+            {
+                return executionContext;
+            }
         }
 
         private ExecutionContext? ShallowClone(bool isFlowSuppressed)
@@ -179,25 +187,7 @@ namespace System.Threading
                 edi = ExceptionDispatchInfo.Capture(ex);
             }
 
-            // Re-enregistrer variables post EH with 1 post-fix so they can be used in registers rather than from stack
-            SynchronizationContext? previousSyncCtx1 = previousSyncCtx;
-            Thread currentThread1 = currentThread;
-            // The common case is that these have not changed, so avoid the cost of a write barrier if not needed.
-            if (currentThread1._synchronizationContext != previousSyncCtx1)
-            {
-                // Restore changed SynchronizationContext back to previous
-                currentThread1._synchronizationContext = previousSyncCtx1;
-            }
-
-            ExecutionContext? previousExecutionCtx1 = previousExecutionCtx;
-            ExecutionContext? currentExecutionCtx1 = currentThread1._executionContext;
-            if (currentExecutionCtx1 != previousExecutionCtx1)
-            {
-                RestoreChangedContextToThread(currentThread1, previousExecutionCtx1, currentExecutionCtx1);
-            }
-
-            // If exception was thrown by callback, rethrow it now original contexts are restored
-            edi?.Throw();
+            RestorePreviousContext(currentThread, previousExecutionCtx, previousSyncCtx, edi);
         }
 
         // Direct copy of the above RunInternal overload, except that it passes the state into the callback strongly-typed and by ref.
@@ -249,25 +239,7 @@ namespace System.Threading
                 edi = ExceptionDispatchInfo.Capture(ex);
             }
 
-            // Re-enregistrer variables post EH with 1 post-fix so they can be used in registers rather than from stack
-            SynchronizationContext? previousSyncCtx1 = previousSyncCtx;
-            Thread currentThread1 = currentThread;
-            // The common case is that these have not changed, so avoid the cost of a write barrier if not needed.
-            if (currentThread1._synchronizationContext != previousSyncCtx1)
-            {
-                // Restore changed SynchronizationContext back to previous
-                currentThread1._synchronizationContext = previousSyncCtx1;
-            }
-
-            ExecutionContext? previousExecutionCtx1 = previousExecutionCtx;
-            ExecutionContext? currentExecutionCtx1 = currentThread1._executionContext;
-            if (currentExecutionCtx1 != previousExecutionCtx1)
-            {
-                RestoreChangedContextToThread(currentThread1, previousExecutionCtx1, currentExecutionCtx1);
-            }
-
-            // If exception was thrown by callback, rethrow it now original contexts are restored
-            edi?.Throw();
+            RestorePreviousContext(currentThread, previousExecutionCtx, previousSyncCtx, edi);
         }
 
         internal static void RunFromThreadPoolDispatchLoop(Thread threadPoolThread, ExecutionContext executionContext, ContextCallback callback, object state)
@@ -296,18 +268,69 @@ namespace System.Threading
                 edi = ExceptionDispatchInfo.Capture(ex);
             }
 
-            // Enregister threadPoolThread as it crossed EH, and use enregistered variable
-            Thread currentThread = threadPoolThread;
+            RestoreDefaultContext(threadPoolThread, previousSyncCtx: null, edi);
+        }
+
+        internal static void RunOnDefaultContext(Thread currentThread, ExecutionContext? previousExecutionCtx, ContextCallback callback, object state)
+        {
+            Debug.Assert(currentThread == Thread.CurrentThread);
+            Debug.Assert(previousExecutionCtx != null && !previousExecutionCtx.m_isDefault);
+            Debug.Assert(currentThread._executionContext == previousExecutionCtx);
+
+            // Non-Default context to restore
+            RestoreChangedContextToThread(currentThread, contextToRestore: null, currentContext: previousExecutionCtx);
+            SynchronizationContext? previousSyncCtx = currentThread._synchronizationContext;
+
+            ExceptionDispatchInfo? edi = null;
+            try
+            {
+                callback.Invoke(state);
+            }
+            catch (Exception ex)
+            {
+                // Note: we have a "catch" rather than a "finally" because we want
+                // to stop the first pass of EH here.  That way we can restore the previous
+                // context before any of our callers' EH filters run.
+                edi = ExceptionDispatchInfo.Capture(ex);
+            }
+
+            RestorePreviousContext(currentThread, previousExecutionCtx, previousSyncCtx, edi);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void RestoreDefaultContext(Thread currentThread, SynchronizationContext? previousSyncCtx, ExceptionDispatchInfo? edi)
+        {
+            // The common case is that these have not changed, so avoid the cost of a write barrier if not needed.
+            if (currentThread._synchronizationContext != previousSyncCtx)
+            {
+                // Restore changed SynchronizationContext back to previous
+                currentThread._synchronizationContext = previousSyncCtx;
+            }
 
             ExecutionContext? currentExecutionCtx = currentThread._executionContext;
-
-            // Restore changed SynchronizationContext back to Default
-            currentThread._synchronizationContext = null;
             if (currentExecutionCtx != null)
             {
-                // The EC always needs to be reset for this overload, as it will flow back to the caller if it performs
-                // extra work prior to returning to the Dispatch loop. For example for Task-likes it will flow out of await points
                 RestoreChangedContextToThread(currentThread, contextToRestore: null, currentExecutionCtx);
+            }
+
+            // If exception was thrown by callback, rethrow it now original contexts are restored
+            edi?.Throw();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void RestorePreviousContext(Thread currentThread, ExecutionContext? previousExecutionCtx, SynchronizationContext? previousSyncCtx, ExceptionDispatchInfo? edi)
+        {
+            // The common case is that these have not changed, so avoid the cost of a write barrier if not needed.
+            if (currentThread._synchronizationContext != previousSyncCtx)
+            {
+                // Restore changed SynchronizationContext back to previous
+                currentThread._synchronizationContext = previousSyncCtx;
+            }
+
+            ExecutionContext? currentExecutionCtx = currentThread._executionContext;
+            if (currentExecutionCtx != previousExecutionCtx)
+            {
+                RestoreChangedContextToThread(currentThread, previousExecutionCtx, currentExecutionCtx);
             }
 
             // If exception was thrown by callback, rethrow it now original contexts are restored

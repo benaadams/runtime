@@ -4,6 +4,7 @@
 
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -462,11 +463,12 @@ namespace System.Runtime.CompilerServices
             /// <summary>Invoked to run MoveNext when this instance is executed from the thread pool.</summary>
             void IThreadPoolWorkItem.Execute()
             {
+                Debug.Assert(!(StateMachine is null));
+
                 ExecutionContext? context = Context;
                 // Call directly if EC flow is suppressed or if context is Default on ThreadPool
                 if (context is null || context.IsDefault)
                 {
-                    Debug.Assert(!(StateMachine is null));
                     StateMachine.MoveNext();
                 }
                 else
@@ -478,16 +480,45 @@ namespace System.Runtime.CompilerServices
             /// <summary>Calls MoveNext on <see cref="StateMachine"/></summary>
             public void MoveNext()
             {
-                ExecutionContext? context = Context;
+                Debug.Assert(!(StateMachine is null));
 
+                ExecutionContext? context = Context;
                 if (context is null)
                 {
-                    Debug.Assert(!(StateMachine is null));
+                    // Flow supressed, run directly.
                     StateMachine.MoveNext();
+                }
+                else if (!context.IsDefault)
+                {
+                    ExecutionContext.RunInternal(context, s_callback, this);
                 }
                 else
                 {
-                    ExecutionContext.RunInternal(context, s_callback, this);
+                    Thread currentThread = Thread.CurrentThread;
+                    ExecutionContext? currentContext = currentThread._executionContext;
+
+                    if (currentContext != null && !currentContext.IsDefault)
+                    {
+                        // Current thread is not on Default
+                        ExecutionContext.RunOnDefaultContext(currentThread, currentContext, s_callback, this);
+                    }
+                    else
+                    {
+                        // On Default and to run on Default; however we need to undo any changes that happen in call.
+                        SynchronizationContext? previousSyncCtx = currentThread._synchronizationContext;
+                        ExceptionDispatchInfo? edi = null;
+                        try
+                        {
+                            // Run directly
+                            StateMachine.MoveNext();
+                        }
+                        catch (Exception ex)
+                        {
+                            edi = ExceptionDispatchInfo.Capture(ex);
+                        }
+
+                        ExecutionContext.RestoreDefaultContext(currentThread, previousSyncCtx, edi);
+                    }
                 }
             }
 
