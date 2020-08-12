@@ -592,6 +592,28 @@ namespace System
 
                         // Subtract Vector128<ushort>.Count so we have now subtracted Vector256<ushort>.Count
                         lengthToExamine -= (nuint)Vector128<ushort>.Count;
+
+                        search = LoadVector256(ref searchStart, 0);
+                        // Bitwise Or to combine the flagged matches for the second value to our match flags
+                        matches = Avx2.MoveMask(
+                                        Avx2.Or(
+                                            Avx2.CompareEqual(values0, search),
+                                            Avx2.CompareEqual(values1, search))
+                                        .AsByte());
+                        // Note that MoveMask has converted the equal vector elements into a set of bit flags,
+                        // So the bit position in 'matches' corresponds to the element offset.
+                        if (matches != 0)
+                        {
+                            // Matched
+                            goto IntrinsicsMatch;
+                        }
+                        else if (length == Vector256<ushort>.Count)
+                        {
+                            goto NotFound;
+                        }
+
+                        offset = (nuint)UnalignedCountVector256(ref searchStart);
+
                         // First time this checks again against 0, however we will move into final compare if it fails.
                         while (lengthToExamine > offset)
                         {
@@ -642,6 +664,27 @@ namespace System
                     Vector128<ushort> search;
                     Vector128<ushort> values0 = Vector128.Create(value0);
                     Vector128<ushort> values1 = Vector128.Create(value1);
+
+                    search = LoadVector128(ref searchStart, 0);
+
+                    matches = Sse2.MoveMask(
+                        Sse2.Or(
+                            Sse2.CompareEqual(values0, search),
+                            Sse2.CompareEqual(values1, search))
+                        .AsByte());
+                    // Note that MoveMask has converted the equal vector elements into a set of bit flags,
+                    // So the bit position in 'matches' corresponds to the element offset.
+                    if (matches != 0)
+                    {
+                        goto IntrinsicsMatch;
+                    }
+                    else if (length == Vector128<ushort>.Count)
+                    {
+                        goto NotFound;
+                    }
+
+                    offset = (nuint)UnalignedCountVector128(ref searchStart);
+
                     // First time this checks against 0 and we will move into final compare if it fails.
                     while (lengthToExamine > offset)
                     {
@@ -1139,6 +1182,16 @@ namespace System
             // If a GC does occur and alignment is lost, the GC cost will outweigh any gains from alignment so it
             // isn't too important to pin to maintain the alignment.
             return (nint)(uint)(-(int)Unsafe.AsPointer(ref searchSpace) / ElementsPerByte) & (Vector128<ushort>.Count - 1);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe nint UnalignedCountVector256(ref char searchSpace)
+        {
+            const int ElementsPerByte = sizeof(ushort) / sizeof(byte);
+            // This alignment is only valid if the GC does not relocate; so we use ReadUnaligned to get the data.
+            // If a GC does occur and alignment is lost, the GC cost will outweigh any gains from alignment so it
+            // isn't too important to pin to maintain the alignment.
+            return (nint)(uint)(-(int)Unsafe.AsPointer(ref searchSpace) / ElementsPerByte) & (Vector256<ushort>.Count - 1);
         }
 
 
