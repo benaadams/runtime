@@ -1487,14 +1487,17 @@ namespace System.Diagnostics.Tracing
 #if FEATURE_PERFTRACING
                 // Register the provider with EventPipe
                 var eventPipeProvider = new OverideEventProvider(this, EventProviderType.EventPipe);
+#endif
                 lock (EventListener.EventListenersLock)
                 {
+#if FEATURE_PERFTRACING
+
                     eventPipeProvider.Register(this);
-                }
 #endif
-                // Add the eventSource to the global (weak) list.
-                // This also sets m_id, which is the index in the list.
-                EventListener.AddEventSource(this);
+                    // Add the eventSource to the global (weak) list.
+                    // This also sets m_id, which is the index in the list.
+                    EventListener.AddEventSource(this);
+                }
 
 #if FEATURE_MANAGED_ETW
                 // OK if we get this far without an exception, then we can at least write out error messages.
@@ -1524,7 +1527,7 @@ namespace System.Diagnostics.Tracing
 #endif
                 Debug.Assert(!m_eventSourceEnabled);     // We can't be enabled until we are completely initted.
                 // We are logically completely initialized at this point.
-                m_completelyInited = true;
+                Volatile.Write(ref m_completelyInited, true);
             }
             catch (Exception e)
             {
@@ -1533,13 +1536,19 @@ namespace System.Diagnostics.Tracing
             }
 
             // Once m_completelyInited is set, you can have concurrency, so all work is under the lock.
+            EventCommandEventArgs? deferredCommands = Volatile.Read(ref m_deferredCommands);
+            if (deferredCommands is null)
+            {
+                // Don't wait for the global lock if we have nothing to do.
+                return;
+            }
+
             lock (EventListener.EventListenersLock)
             {
                 // If there are any deferred commands, we can do them now.
                 // This is the most likely place for exceptions to happen.
                 // Note that we are NOT resetting m_deferredCommands to NULL here,
                 // We are giving for EventHandler<EventCommandEventArgs> that will be attached later
-                EventCommandEventArgs? deferredCommands = m_deferredCommands;
                 while (deferredCommands != null)
                 {
                     DoCommand(deferredCommands);      // This can never throw, it catches them and reports the errors.
@@ -2543,6 +2552,9 @@ namespace System.Diagnostics.Tracing
             }
 
             var commandArgs = new EventCommandEventArgs(command, commandArguments, this, listener, eventProviderType, perEventSourceSessionId, etwSessionId, enable, level, matchAnyKeyword);
+            // Create the first entry as sentinel if one not created.
+            var sentinelSet = Interlocked.CompareExchange(ref m_deferredCommands, commandArgs, null) == null;
+
             lock (EventListener.EventListenersLock)
             {
                 if (m_completelyInited)
@@ -2555,11 +2567,7 @@ namespace System.Diagnostics.Tracing
                 else
                 {
                     // We can't do the command, simply remember it and we do it when we are fully constructed.
-                    if (m_deferredCommands == null)
-                    {
-                        m_deferredCommands = commandArgs;       // create the first entry
-                    }
-                    else
+                    if (!sentinelSet)
                     {
                         // We have one or more entries, find the last one and add it to that.
                         EventCommandEventArgs lastCommand = m_deferredCommands;
@@ -4120,66 +4128,64 @@ namespace System.Diagnostics.Tracing
         /// <param name="newEventSource"></param>
         internal static void AddEventSource(EventSource newEventSource)
         {
-            lock (EventListenersLock)
-            {
-                Debug.Assert(s_EventSources != null);
+            Debug.Assert(Monitor.IsEntered(EventListener.EventListenersLock));
+            Debug.Assert(s_EventSources != null);
 
 #if ES_BUILD_STANDALONE
-                // netcoreapp build calls DisposeOnShutdown directly from AppContext.OnProcessExit
-                if (!s_EventSourceShutdownRegistered)
-                {
-                    s_EventSourceShutdownRegistered = true;
-                    AppDomain.CurrentDomain.ProcessExit += DisposeOnShutdown;
-                    AppDomain.CurrentDomain.DomainUnload += DisposeOnShutdown;
-                }
+            // netcoreapp build calls DisposeOnShutdown directly from AppContext.OnProcessExit
+            if (!s_EventSourceShutdownRegistered)
+            {
+                s_EventSourceShutdownRegistered = true;
+                AppDomain.CurrentDomain.ProcessExit += DisposeOnShutdown;
+                AppDomain.CurrentDomain.DomainUnload += DisposeOnShutdown;
+            }
 #endif
 
-                // Periodically search the list for existing entries to reuse, this avoids
-                // unbounded memory use if we keep recycling eventSources (an unlikely thing).
-                int newIndex = -1;
-                if (s_EventSources.Count % 64 == 63)   // on every block of 64, fill up the block before continuing
+            // Periodically search the list for existing entries to reuse, this avoids
+            // unbounded memory use if we keep recycling eventSources (an unlikely thing).
+            int newIndex = -1;
+            if (s_EventSources.Count % 64 == 63)   // on every block of 64, fill up the block before continuing
+            {
+                int i = s_EventSources.Count;      // Work from the top down.
+                while (0 < i)
                 {
-                    int i = s_EventSources.Count;      // Work from the top down.
-                    while (0 < i)
+                    --i;
+                    WeakReference<EventSource> weakRef = s_EventSources[i];
+                    if (!weakRef.TryGetTarget(out _))
                     {
-                        --i;
-                        WeakReference<EventSource> weakRef = s_EventSources[i];
-                        if (!weakRef.TryGetTarget(out _))
-                        {
-                            newIndex = i;
-                            weakRef.SetTarget(newEventSource);
-                            break;
-                        }
+                        newIndex = i;
+                        weakRef.SetTarget(newEventSource);
+                        break;
                     }
                 }
-                if (newIndex < 0)
-                {
-                    newIndex = s_EventSources.Count;
-                    s_EventSources.Add(new WeakReference<EventSource>(newEventSource));
-                }
-                newEventSource.m_id = newIndex;
-
-#if DEBUG
-                // Disable validation of EventSource/EventListener connections in case a call to EventSource.AddListener
-                // causes a recursive call into this method.
-                bool previousValue = s_ConnectingEventSourcesAndListener;
-                s_ConnectingEventSourcesAndListener = true;
-                try
-                {
-#endif
-                    // Add every existing dispatcher to the new EventSource
-                    for (EventListener? listener = s_Listeners; listener != null; listener = listener.m_Next)
-                        newEventSource.AddListener(listener);
-#if DEBUG
-                }
-                finally
-                {
-                    s_ConnectingEventSourcesAndListener = previousValue;
-                }
-#endif
-
-                Validate();
             }
+            if (newIndex < 0)
+            {
+                newIndex = s_EventSources.Count;
+                s_EventSources.Add(new WeakReference<EventSource>(newEventSource));
+            }
+            newEventSource.m_id = newIndex;
+
+#if DEBUG
+            // Disable validation of EventSource/EventListener connections in case a call to EventSource.AddListener
+            // causes a recursive call into this method.
+            bool previousValue = s_ConnectingEventSourcesAndListener;
+            s_ConnectingEventSourcesAndListener = true;
+            try
+            {
+#endif
+                // Add every existing dispatcher to the new EventSource
+                for (EventListener? listener = s_Listeners; listener != null; listener = listener.m_Next)
+                    newEventSource.AddListener(listener);
+#if DEBUG
+            }
+            finally
+            {
+                s_ConnectingEventSourcesAndListener = previousValue;
+            }
+#endif
+
+            Validate();
         }
 
         // Whenver we have async callbacks from native code, there is an ugly issue where
