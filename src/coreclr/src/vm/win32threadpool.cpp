@@ -276,6 +276,45 @@ retry:
     }
 }
 
+void ThreadpoolMgr::EnsureManagedThreadPoolInitialized()
+{
+    WRAPPER_NO_CONTRACT;
+    // QueueUserWorkItem is not intended to be supported in this mode, and there are call sites of this function where
+    // managed code cannot be called instead to queue a work item. Use a timer with zero due time instead, which would on
+    // the timer thread call into managed code to queue a work item.
+
+    NewHolder<ThreadpoolMgr::TimerInfoContext> timerContextHolder = new ThreadpoolMgr::TimerInfoContext();
+    timerContextHolder->TimerId = 0;
+
+    HANDLE doBackgroundWorkTimerHandle = nullptr;
+    if (!ThreadpoolMgr::CreateTimerQueueTimer(
+        &doBackgroundWorkTimerHandle,
+        SetupManagedThreadPoolCallback,
+        timerContextHolder,
+        0 /* DueTime */,
+        (DWORD)-1 /* Period, non-repeating */,
+        0 /* Flags */))
+    {
+        _ASSERTE(doBackgroundWorkTimerHandle == nullptr);
+        ThrowOutOfMemory();
+    }
+
+    timerContextHolder.SuppressRelease(); // the timer context is automatically deleted by the timer infrastructure
+}
+
+void WINAPI ThreadpoolMgr::SetupManagedThreadPoolCallback(PVOID parameter, BOOLEAN timerFired)
+{
+    CONTRACTL
+    {
+        THROWS;
+        GC_TRIGGERS;
+        MODE_PREEMPTIVE;
+    }
+    CONTRACTL_END;
+
+    _ASSERTE(timerFired);
+}
+
 DWORD GetDefaultMaxLimitWorkerThreads(DWORD minLimit)
 {
     CONTRACTL

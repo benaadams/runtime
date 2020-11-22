@@ -627,6 +627,10 @@ HRESULT CorHost2::CreateAppDomainWithManager(
         setup.Call(args);
     }
 
+    // Trigger initialization of managed ThreadPool on seperate thread
+    // after AppContext switches have been set.
+    ThreadpoolMgr::EnsureManagedThreadPoolInitialized();
+
     LPCWSTR pwzNativeDllSearchDirectories = NULL;
     LPCWSTR pwzTrustedPlatformAssemblies = NULL;
     LPCWSTR pwzPlatformResourceRoots = NULL;

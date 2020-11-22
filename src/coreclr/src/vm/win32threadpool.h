@@ -206,8 +206,11 @@ public:
         }
     };
 
+    static void WINAPI SetupManagedThreadPoolCallback(PVOID parameter, BOOLEAN timerFired);
+
 public:
 
+    static void EnsureManagedThreadPoolInitialized();
     static void ReportThreadStatus(bool isWorking);
 
     // enumeration of different kinds of memory blocks that are recycled
