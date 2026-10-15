@@ -9817,11 +9817,16 @@ void Lowering::AfterLowerBlocks()
         }
 #ifdef TARGET_AMD64
         LowerMultiplyCarryLoops();
-        LowerMaskSelects();
 #else
         LowerArm64MultiplyCarryLoops();
 #endif
     }
+#ifdef TARGET_AMD64
+    if (m_compiler->opts.OptimizationEnabled())
+    {
+        LowerMaskSelects();
+    }
+#endif
 #endif
 }
 #endif // !TARGET_WASM
@@ -15093,12 +15098,13 @@ bool Lowering::TryLowerMultiplyCarryRows()
 
 //------------------------------------------------------------------------
 // LowerMaskSelects: Turn constant-time selects written with a mask made from a
-// flags bit,
+// flags bit, or an explicitly masked low bit,
 //     mask = 0 - bit;  r_i = t_i ^ ((t_i ^ s_i) & mask)   (bit from a SETCC)
 // into CMOVs that read the bit's flags directly. The mask's only uses must be
 // such selects and the flags must still hold the bit at every select, which is
 // typical right after a carry or borrow chain. This removes the SETCC, NEG, AND
-// and XOR latency that the select otherwise adds after the chain.
+// and XOR latency that the select otherwise adds after the chain. Low-bit
+// masks instead use TEST, repeated after any intervening flag clobber.
 //
 void Lowering::LowerMaskSelects()
 {
@@ -15117,7 +15123,7 @@ void Lowering::LowerMaskSelects()
             hasMask |= node->OperIs(GT_NEG);
         }
         // A rewrite removes nodes, so look again with fresh reference links after each one.
-        while (hasMask && TryLowerMaskSelect())
+        while (hasMask && (TryLowerMaskSelect() || TryLowerMaskedXorSwap()))
         {
         }
     }
@@ -15211,30 +15217,45 @@ bool Lowering::TryLowerMaskSelect()
             andOne = value;
             value  = value->gtGetOp1();
         }
+        // Preserve direct carry-flag reuse when available. Otherwise an
+        // explicit AND with one still proves the mask is boolean: save its
+        // input and test that low bit at the selects.
+        GenTree* originalValue = value;
+        bool canUseCC = true;
         if (value->OperIs(GT_LCL_VAR))
         {
             bitRead = value;
-            if (!prevRef.Lookup(bitRead, &bitDef) || !bitDef->OperIs(GT_STORE_LCL_VAR) ||
-                m_compiler->lvaGetDesc(bitRead->AsLclVar()->GetLclNum())->IsAddressExposed())
+            canUseCC = prevRef.Lookup(bitRead, &bitDef) && bitDef->OperIs(GT_STORE_LCL_VAR) &&
+                       !m_compiler->lvaGetDesc(bitRead->AsLclVar()->GetLclNum())->IsAddressExposed();
+            if (canUseCC)
+            {
+                value = bitDef->gtGetOp1();
+            }
+        }
+        GenTree* cast = nullptr;
+        if (canUseCC && value->OperIs(GT_CAST) && !value->gtOverflow() && value->AsCast()->CastOp()->TypeIs(TYP_INT))
+        {
+            cast = value;
+            value = value->AsCast()->CastOp();
+        }
+        canUseCC = canUseCC && value->OperIs(GT_SETCC) &&
+                   (GenConditionDesc::Get(value->AsCC()->gtCondition).oper == GT_NONE) &&
+                   (value->gtPrev != nullptr) && value->gtPrev->gtSetFlags();
+        bool testBit = !canUseCC;
+        if (testBit)
+        {
+            if (andOne == nullptr)
             {
                 continue;
             }
-            value = bitDef->gtGetOp1();
+            value = originalValue;
+            bitRead = nullptr;
+            bitDef = nullptr;
+            cast = nullptr;
         }
-        GenTree* cast = nullptr;
-        if (value->OperIs(GT_CAST) && !value->gtOverflow() && value->AsCast()->CastOp()->TypeIs(TYP_INT))
-        {
-            cast  = value;
-            value = value->AsCast()->CastOp();
-        }
-        if (!value->OperIs(GT_SETCC) || (GenConditionDesc::Get(value->AsCC()->gtCondition).oper != GT_NONE) ||
-            (value->gtPrev == nullptr) || !value->gtPrev->gtSetFlags())
-        {
-            continue;
-        }
-        GenTree*     cc       = value;
-        GenTree*     producer = cc->gtPrev;
-        GenCondition cond     = cc->AsCC()->gtCondition;
+        GenTree*     cc       = testBit ? nullptr : value;
+        GenTree*     producer = testBit ? andOne : cc->gtPrev;
+        GenCondition cond     = testBit ? GenCondition::NE : cc->AsCC()->gtCondition;
 
         // Every read of the mask value must be a select t ^ ((t ^ s) & mask).
         selects.clear();
@@ -15346,15 +15367,26 @@ bool Lowering::TryLowerMaskSelect()
             remaining -= isSelect ? 1 : 0;
             valid = (node != nullptr) && (isSelect || isRemoved(node) || IsCarryFlagsCrossing(node));
         }
-        if (!valid)
+        if (!valid && !testBit)
         {
             continue;
         }
 
+        unsigned testedLocal = BAD_VAR_NUM;
+        if (testBit)
+        {
+            testedLocal = m_compiler->lvaGrabTemp(true DEBUGARG("mask select tested value"));
+            m_compiler->lvaGetDesc(testedLocal)->lvType = andOne->TypeGet();
+            GenTree* operand = andOne->gtGetOp1();
+            operand->ClearContained(); operand->ClearRegOptional();
+            GenTree* save = m_compiler->gtNewStoreLclVarNode(testedLocal, operand);
+            BlockRange().InsertBefore(andOne, save);
+        }
         JITDUMP("Selecting with the flags of [%06u] in %u CMOVs instead of mask [%06u]\n", producer->gtTreeID,
                 (unsigned)selects.size(), maskStore->gtTreeID);
         // A select can choose another one's result: Select(Select(a, b, mask), c, mask).
         NodeToNodeMap rewritten(alloc);
+        GenTree* previousSelect = nullptr;
         for (const Select& select : selects)
         {
             GenTree* s = select.s;
@@ -15363,7 +15395,24 @@ bool Lowering::TryLowerMaskSelect()
             s->ClearRegOptional();
             select.t->ClearContained();
             select.t->ClearRegOptional();
+            bool reuseTest = testBit && previousSelect != nullptr;
+            GenTree* between = reuseTest ? previousSelect->gtNext : nullptr;
+            while (reuseTest && between != select.outer)
+            {
+                reuseTest = between != nullptr && (isRemoved(between) || IsCarryFlagsCrossing(between));
+                if (reuseTest) between = between->gtNext;
+            }
+            if (testBit && !reuseTest)
+            {
+                GenTree* tested = m_compiler->gtNewLclvNode(testedLocal, andOne->TypeGet());
+                GenTree* one = andOne->TypeIs(TYP_LONG) ? m_compiler->gtNewLconNode(1) : m_compiler->gtNewIconNode(1);
+                GenTree* test = m_compiler->gtNewOperNode(GT_TEST, TYP_VOID, tested, one);
+                test->gtFlags |= GTF_SET_FLAGS;
+                BlockRange().InsertBefore(select.outer, tested, one, test);
+                ContainCheckCompare(test->AsOp());
+            }
             GenTree* cmov = m_compiler->gtNewOperCC(GT_SELECTCC, select.outer->TypeGet(), cond, s, select.t);
+            previousSelect = cmov;
             rewritten.Set(select.outer, cmov);
             BlockRange().InsertBefore(select.outer, cmov);
             LIR::Use use;
@@ -15389,6 +15438,251 @@ bool Lowering::TryLowerMaskSelect()
                 BlockRange().Remove(node);
             }
         }
+        return true;
+    }
+    return false;
+}
+
+//------------------------------------------------------------------------
+// TryLowerMaskedXorSwap: CSE shares (a ^ b) & (0 - bit) between the two
+// outputs of a conditional swap. Recognize every use of the mask and replace
+// the shared XOR deltas with selects of saved operands. Consume either the
+// original comparison flags or a TEST of an explicitly masked low bit.
+// Reject escaping values, intervening stores and flag clobbers. Save each
+// source before either output overwrites it; only non-exposed integer locals
+// are eligible. The ordinary select pass handles unshared rollback selects.
+//
+bool Lowering::TryLowerMaskedXorSwap()
+{
+    typedef JitHashTable<GenTree *, JitPtrKeyFuncs<GenTree>, GenTree *> NodeMap;
+    typedef JitHashTable<unsigned, JitSmallPrimitiveKeyFuncs<unsigned>, GenTree *> LocalMap;
+    CompAllocator alloc = m_compiler->getAllocator(CMK_Lower);
+    NodeMap prevRef(alloc), nextRef(alloc);
+    LocalMap lastRef(alloc);
+    for (GenTree *node : BlockRange())
+    {
+        if (m_maskSelectScanBudget == 0)
+            return false;
+        m_maskSelectScanBudget--;
+        if (node->OperIsLocal())
+        {
+            unsigned local = node->AsLclVarCommon()->GetLclNum();
+            GenTree *last = nullptr;
+            if (lastRef.Lookup(local, &last))
+            {
+                prevRef.Set(node, last);
+                nextRef.Set(last, node);
+            }
+            lastRef.Set(local, node, LocalMap::Overwrite);
+        }
+    }
+    auto safeLocal = [&](GenTree *node) -> bool {
+        if (!node->OperIs(GT_LCL_VAR))
+            return false;
+        LclVarDsc *dsc = m_compiler->lvaGetDesc(node->AsLclVar()->GetLclNum());
+        return !dsc->IsAddressExposed() && !dsc->lvPromoted && !dsc->lvIsStructField;
+    };
+    auto definition = [&](GenTree *node) -> GenTree * {
+        GenTree *previous = nullptr;
+        while (prevRef.Lookup(node, &previous))
+        {
+            if (previous->OperIsLocalStore())
+                return previous;
+            node = previous;
+        }
+        return nullptr;
+    };
+    struct SwapUse
+    {
+        GenTree *read;
+        GenTree *outer;
+        GenTree *t;
+        unsigned source;
+    };
+    struct Group
+    {
+        GenTree *store;
+        GenTree *inner;
+        GenTree *andNode;
+        GenTree *mask;
+        GenTree *x;
+        GenTree *y;
+        SwapUse uses[2];
+    };
+    jitstd::vector<SwapUse> uses(alloc);
+    jitstd::vector<Group> groups(alloc);
+    for (GenTree *maskDef : BlockRange())
+    {
+        if (!maskDef->OperIs(GT_STORE_LCL_VAR) || !maskDef->TypeIs(TYP_INT, TYP_LONG))
+            continue;
+        GenTree *neg = maskDef->gtGetOp1();
+        if (!neg->OperIs(GT_NEG) || neg->gtSetFlags())
+            continue;
+        GenTree *bit = neg->gtGetOp1();
+        GenTree *cast = nullptr;
+        if (bit->OperIs(GT_CAST) && !bit->gtOverflow() && bit->AsCast()->CastOp()->TypeIs(TYP_INT))
+        {
+            cast = bit;
+            bit = bit->AsCast()->CastOp();
+        }
+        bool fromAnd = bit->OperIs(GT_AND) && bit->gtGetOp2()->IsIntegralConst(1) && !bit->gtSetFlags();
+        bool fromRelop = bit->OperIsCompare() && bit->gtGetOp1()->TypeIs(TYP_INT, TYP_LONG);
+        bool fromCC = bit->OperIs(GT_SETCC) && bit->gtPrev != nullptr && bit->gtPrev->gtSetFlags() &&
+                      GenConditionDesc::Get(bit->AsCC()->gtCondition).oper == GT_NONE;
+
+        if (!fromAnd && !fromCC && !fromRelop)
+            continue;
+        GenTree *producer = fromCC ? bit->gtPrev : bit;
+        GenCondition cond = fromCC      ? bit->AsCC()->gtCondition
+                            : fromRelop ? GenCondition::FromRelop(bit)
+                                        : GenCondition::NE;
+        groups.clear();
+        GenTree *maskRef = maskDef;
+        GenTree *maskRead = nullptr;
+        bool valid = true;
+        while (valid && nextRef.Lookup(maskRef, &maskRead) && maskRead->OperIs(GT_LCL_VAR))
+        {
+            LIR::Use maskUse, andUse;
+            valid = safeLocal(maskRead) && maskRead->TypeIs(maskDef->TypeGet()) &&
+                    BlockRange().TryGetUse(maskRead, &maskUse) && maskUse.User()->OperIs(GT_AND);
+            if (!valid)
+                break;
+            GenTree *andNode = maskUse.User();
+            GenTree *inner = andNode->gtGetOp1() == maskRead ? andNode->gtGetOp2() : andNode->gtGetOp1();
+            valid = inner->OperIs(GT_XOR) && !inner->gtSetFlags() && !andNode->gtSetFlags() &&
+                    BlockRange().TryGetUse(andNode, &andUse) && andUse.User()->OperIs(GT_STORE_LCL_VAR);
+            if (!valid)
+                break;
+            GenTree *store = andUse.User();
+            valid = andNode->TypeIs(maskDef->TypeGet()) && inner->TypeIs(maskDef->TypeGet()) &&
+                    store->TypeIs(maskDef->TypeGet());
+            if (!valid)
+                break;
+            GenTree *x = inner->gtGetOp1();
+            GenTree *y = inner->gtGetOp2();
+            valid = safeLocal(x) && safeLocal(y) && x->TypeIs(maskDef->TypeGet()) && y->TypeIs(maskDef->TypeGet()) &&
+                    x->AsLclVar()->GetLclNum() != y->AsLclVar()->GetLclNum();
+            if (!valid)
+                break;
+            uses.clear();
+            GenTree *ref = store;
+            GenTree *read = nullptr;
+            while (valid && nextRef.Lookup(ref, &read) && read->OperIs(GT_LCL_VAR))
+            {
+                LIR::Use use;
+                valid = safeLocal(read) && BlockRange().TryGetUse(read, &use) && use.User()->OperIs(GT_XOR) &&
+                        !use.User()->gtSetFlags();
+                if (!valid)
+                    break;
+                GenTree *outer = use.User();
+                GenTree *t = outer->gtGetOp1() == read ? outer->gtGetOp2() : outer->gtGetOp1();
+                valid = safeLocal(t) && t->TypeIs(maskDef->TypeGet()) && outer->TypeIs(maskDef->TypeGet());
+                unsigned source = 2;
+                if (valid)
+                {
+                    if (t->AsLclVar()->GetLclNum() == x->AsLclVar()->GetLclNum() && definition(t) == definition(x))
+                        source = 1;
+                    if (t->AsLclVar()->GetLclNum() == y->AsLclVar()->GetLclNum() && definition(t) == definition(y))
+                        source = 0;
+                    valid = source != 2;
+                }
+                if (valid)
+                    uses.push_back({read, outer, t, source});
+                ref = read;
+            }
+            valid = valid && uses.size() == 2 &&
+                    (nextRef.Lookup(ref, &read) ? read->OperIs(GT_STORE_LCL_VAR)
+                                                : IsCarryLocalDeadOnExit(store->AsLclVar()->GetLclNum(), m_block));
+            if (valid)
+                groups.push_back({store, inner, andNode, maskRead, x, y, {uses[0], uses[1]}});
+            maskRef = maskRead;
+        }
+
+        if (!valid || groups.empty() ||
+            (!nextRef.Lookup(maskRef, &maskRead) && !IsCarryLocalDeadOnExit(maskDef->AsLclVar()->GetLclNum(), m_block)))
+            continue;
+        auto removed = [&](GenTree *node) -> bool {
+            if (node == neg || node == maskDef || node == cast || (fromCC && node == bit))
+                return true;
+            for (const Group &group : groups)
+            {
+                if (node == group.store || node == group.inner || node == group.andNode || node == group.mask)
+                    return true;
+                for (const SwapUse &use : group.uses)
+                    if (node == use.read || node == use.outer)
+                        return true;
+            }
+            return false;
+        };
+        unsigned remaining = (unsigned)groups.size() * 2;
+        for (GenTree *node = producer->gtNext; valid && remaining != 0; node = node->gtNext)
+        {
+            if (node == nullptr)
+            {
+                valid = false;
+                break;
+            }
+
+            for (const Group &group : groups)
+                for (const SwapUse &use : group.uses)
+                    remaining -= node == use.outer ? 1 : 0;
+            valid = removed(node) || IsCarryFlagsCrossing(node);
+        }
+        if (!valid)
+            continue;
+
+        if (fromAnd || fromRelop)
+        {
+            GenTree *test =
+                m_compiler->gtNewOperNode(fromRelop ? GT_CMP : GT_TEST, TYP_VOID, bit->gtGetOp1(), bit->gtGetOp2());
+
+            test->gtFlags |= GTF_SET_FLAGS;
+            BlockRange().InsertBefore(bit, test);
+
+            BlockRange().Remove(bit);
+
+            test->gtGetOp1()->ClearContained();
+            test->gtGetOp1()->ClearRegOptional();
+            test->gtGetOp2()->ClearContained();
+            test->gtGetOp2()->ClearRegOptional();
+            ContainCheckCompare(test->AsOp());
+        }
+        for (const Group &group : groups)
+        {
+            unsigned temps[2];
+            GenTree *values[2] = {group.x, group.y};
+            for (unsigned i = 0; i < 2; i++)
+            {
+                temps[i] = m_compiler->lvaGrabTemp(true DEBUGARG("masked XOR swap operand"));
+                m_compiler->lvaGetDesc(temps[i])->lvType = maskDef->TypeGet();
+                values[i]->ClearContained();
+                values[i]->ClearRegOptional();
+                GenTree *save = m_compiler->gtNewStoreLclVarNode(temps[i], values[i]);
+                BlockRange().InsertBefore(group.inner, save);
+            }
+            for (const SwapUse &use : group.uses)
+            {
+                GenTree *s = m_compiler->gtNewLclvNode(temps[use.source], maskDef->TypeGet());
+                use.t->ClearContained();
+                use.t->ClearRegOptional();
+                GenTree *cmov = m_compiler->gtNewOperCC(GT_SELECTCC, maskDef->TypeGet(), cond, s, use.t);
+                BlockRange().InsertBefore(use.outer, s, cmov);
+                LIR::Use outerUse;
+                if (BlockRange().TryGetUse(use.outer, &outerUse))
+                    outerUse.ReplaceWith(cmov);
+                else
+                    cmov->SetUnusedValue();
+                BlockRange().Remove(use.read);
+                BlockRange().Remove(use.outer);
+                ContainCheckSelect(cmov->AsOp());
+            }
+            for (GenTree *node : {group.inner, group.andNode, group.store, group.mask})
+                BlockRange().Remove(node);
+        }
+        for (GenTree *node : {maskDef, neg, cast, fromCC ? bit : nullptr})
+            if (node != nullptr)
+                BlockRange().Remove(node);
+        JITDUMP("Lowered shared masked XOR swaps to flag selects\n");
         return true;
     }
     return false;

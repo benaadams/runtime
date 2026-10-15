@@ -185,6 +185,7 @@ private:
     bool     TryLowerMultiplyCarryRows();
     void     LowerMaskSelects();
     bool     TryLowerMaskSelect();
+    bool     TryLowerMaskedXorSwap();
     void     TryLowerMultiplyCarryBackedge();
     void     LowerMultiplyCarryMultiplier();
     void     LowerMultiplyCarryLoads();
