@@ -14458,6 +14458,7 @@ bool Lowering::TryLowerMultiplyCarryRows()
 
     struct Lane
     {
+        bool recognized;
         GenTree* product;
         GenTree* productStore;
         unsigned lowLocal;
@@ -14664,8 +14665,7 @@ bool Lowering::TryLowerMultiplyCarryRows()
     // Describe each lane: its two product halves and up to two (ADD, ADD_CARRY) pairs. The rewrite
     // keeps the values of both halves, so they may have other readers; only the intermediates
     // whose values change (the partial sum and the carried high words) need a single reader.
-    for (Lane& lane : lanes)
-    {
+    auto describeLane = [&](Lane& lane) -> bool {
         lane.productStore = storeOf(lane.product);
         if (lane.productStore == nullptr)
         {
@@ -14711,7 +14711,7 @@ bool Lowering::TryLowerMultiplyCarryRows()
         if (highRead == nullptr)
         {
             // No accumulation: the halves are used as they are.
-            continue;
+            return true;
         }
         lane.add[0] = lane.adc[0]->gtPrev;
         if (!isFlagsAdd(lane.add[0]) || (pos(highRead) < pos(lane.productStore)))
@@ -14753,7 +14753,7 @@ bool Lowering::TryLowerMultiplyCarryRows()
                 JITDUMP("Rows: product [%06u] carry is not stored\n", lane.product->gtTreeID);
                 return false;
             }
-            continue;
+            return true;
         }
         lane.add[1] = partialUse.User();
         lane.adc[1] = high1Use.User();
@@ -14766,17 +14766,33 @@ bool Lowering::TryLowerMultiplyCarryRows()
             JITDUMP("Rows: product [%06u] carry is not stored\n", lane.product->gtTreeID);
             return false;
         }
+        return true;
+    };
+    for (Lane& lane : lanes)
+    {
+        lane.recognized = describeLane(lane);
     }
 
     bool changed = false;
     for (size_t start = 0; start < lanes.size();)
     {
+        // An unrelated product (such as a square's diagonal) must not prevent
+        // independent, fully matched rows elsewhere in the block from lowering.
+        if (!lanes[start].recognized)
+        {
+            start++;
+            continue;
+        }
         // Extend the row while the next lane accumulates this lane's high word.
         size_t end = start + 1;
         for (; end < lanes.size(); end++)
         {
             Lane&    prev  = lanes[end - 1];
             Lane&    lane  = lanes[end];
+            if (!lane.recognized)
+            {
+                break;
+            }
             // A bare lane passes its raw high word, whose value the rewrite keeps.
             GenTree* carry  = (prev.addCount == 0) ? nullptr : singleReader(prev.highOutStore);
             unsigned addend = BAD_VAR_NUM;
@@ -14946,6 +14962,41 @@ bool Lowering::TryLowerMultiplyCarryRows()
                 break;
             }
         }
+        // The source multiplier can stay live for later rows or a diagonal.
+        // A row-local copy gives its consecutive fixed RDX uses an independent
+        // interval, preventing unrelated operands from repeatedly evicting it.
+        unsigned multiplierCopy = BAD_VAR_NUM;
+        bool multiplierLivesAfterRow = false;
+        if (multiplierLocal != BAD_VAR_NUM)
+        {
+            GenTreeHWIntrinsic* lastProduct = lanes[last].product->AsHWIntrinsic();
+            GenTree* lastRead = nullptr;
+            for (GenTree* operand : lastProduct->Operands())
+            {
+                if (operand->OperIs(GT_LCL_VAR) && operand->AsLclVar()->GetLclNum() == multiplierLocal &&
+                    ((lastRead == nullptr) || (pos(operand) > pos(lastRead))))
+                {
+                    lastRead = operand;
+                }
+            }
+            GenTree* next = nullptr;
+            multiplierLivesAfterRow = (lastRead != nullptr) && nextRef.Lookup(lastRead, &next) &&
+                                      next->OperIs(GT_LCL_VAR);
+        }
+        if (multiplierLivesAfterRow)
+        {
+            multiplierCopy = m_compiler->lvaGrabTemp(true DEBUGARG("ADX row multiplier"));
+            m_compiler->lvaGetDesc(multiplierCopy)->lvType = TYP_LONG;
+            GenTree* read = m_compiler->gtNewLclvNode(multiplierLocal, TYP_LONG);
+            GenTree* store = m_compiler->gtNewStoreLclVarNode(multiplierCopy, read);
+            GenTree* before = firstProduct->Op(1);
+            if (firstProduct->Op(2)->OperIs(GT_LCL_VAR) &&
+                firstProduct->Op(2)->AsLclVar()->GetLclNum() == multiplierLocal)
+            {
+                before = firstProduct->Op(2);
+            }
+            BlockRange().InsertBefore(before, read, store);
+        }
         for (size_t i = first; i <= last; i++)
         {
             Lane& lane = lanes[i];
@@ -14958,8 +15009,19 @@ bool Lowering::TryLowerMultiplyCarryRows()
                 {
                     std::swap(product->Op(1), product->Op(2));
                 }
-                product->Op(1)->ClearContained();
-                product->Op(1)->ClearRegOptional();
+                if (multiplierCopy != BAD_VAR_NUM)
+                {
+                    GenTree* oldRead = product->Op(1);
+                    GenTree* rowRead = m_compiler->gtNewLclvNode(multiplierCopy, TYP_LONG);
+                    BlockRange().InsertBefore(oldRead, rowRead);
+                    product->Op(1) = rowRead;
+                    BlockRange().Remove(oldRead);
+                }
+                else
+                {
+                    product->Op(1)->ClearContained();
+                    product->Op(1)->ClearRegOptional();
+                }
             }
             if (lane.addCount == 0)
             {
@@ -15901,6 +15963,7 @@ bool Lowering::LowerFullAdders()
         {
             if (++nodeCount > 8192)
             {
+                JITDUMP("Full adders: method exceeds node budget\n");
                 return false;
             }
         }
@@ -16086,6 +16149,7 @@ bool Lowering::LowerFullAdders()
                 local = outputLocal;
                 if (adders.size() == 128)
                 {
+                    JITDUMP("Full adders: method exceeds candidate budget\n");
                     return false;
                 }
                 adders.push_back(
@@ -16390,16 +16454,21 @@ bool Lowering::IsCarryFlagsCrossing(GenTree* node)
 //
 void Lowering::LowerCarryChains()
 {
-    unsigned budget = 2048;
+    // Match the method-size allowance in LowerFullAdders.
+    unsigned budget = 8192;
     for (BasicBlock* block : m_compiler->Blocks())
     {
         m_block = block;
         for (GenTree* node = BlockRange().FirstNode(); node != nullptr;)
         {
-            if (budget-- == 0)
+            // The optional final-limb search is budgeted independently of
+            // forwarding already recognized carries below. A large block can
+            // exhaust this allowance before its first forwarding walk.
+            if (budget == 0)
             {
-                return;
+                break;
             }
+            budget--;
             GenTree* next = node->gtNext;
             // Full-adder lowering creates SETCCs after the ordinary lowering
             // walk. Let the last limb consume such a carry directly as well.
