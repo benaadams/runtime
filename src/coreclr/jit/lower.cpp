@@ -13972,12 +13972,11 @@ void Lowering::LowerMultiplyCarryLoops()
     }
     for (BasicBlock* block : loops)
     {
-        m_block     = block;
-        bool hasAdx = TryLowerMultiplyCarryChain();
+        m_block      = block;
+        bool hasAdx  = TryLowerMultiplyCarryChain();
         bool hasRows = !hasAdx && TryLowerMultiplyCarryRows();
         hasAdx |= hasRows;
-        if (!hasRows && block->KindIs(BBJ_COND) && block->GetTrueTarget() == block &&
-            block->GetFalseTarget() != block)
+        if (!hasRows && block->KindIs(BBJ_COND) && block->GetTrueTarget() == block && block->GetFalseTarget() != block)
         {
             TryLowerMultiplyCarryBackedge();
             hasAdx |= TryLowerMultiplyCarryLoop();
@@ -14462,7 +14461,7 @@ bool Lowering::TryLowerMultiplyCarryRows()
         GenTree* productStore;
         unsigned lowLocal;
         unsigned highLocal;
-        GenTree* lowRead;  // the read of the low word that the lane adds to
+        GenTree* lowRead; // the read of the low word that the lane adds to
         unsigned addCount;
         GenTree* add[2];
         GenTree* adc[2];
@@ -14593,8 +14592,8 @@ bool Lowering::TryLowerMultiplyCarryRows()
                !m_compiler->lvaGetDesc(parent)->lvIsParam && (outsideRefs[local] == 0) && (outsideRefs[parent] == 0) &&
                !addressed[local] && !addressed[parent] && (firstRef[parent] != nullptr) &&
                firstRef[parent]->OperIs(GT_STORE_LCL_VAR) &&
-               ((parent == local) ||
-                ((stores[local] == 0) && (firstRef[local] != nullptr) && (pos(firstRef[local]) > pos(firstRef[parent]))));
+               ((parent == local) || ((stores[local] == 0) && (firstRef[local] != nullptr) &&
+                                      (pos(firstRef[local]) > pos(firstRef[parent]))));
     };
 
     // Whether a read is the only reader of the value it observes: the previous reference to
@@ -14731,8 +14730,7 @@ bool Lowering::TryLowerMultiplyCarryRows()
             JITDUMP("Rows: product [%06u] low word is not added before its carry\n", lane.product->gtTreeID);
             return false;
         }
-        lane.other[0] =
-            (lane.add[0]->gtGetOp1() == lane.lowRead) ? lane.add[0]->gtGetOp2() : lane.add[0]->gtGetOp1();
+        lane.other[0] = (lane.add[0]->gtGetOp1() == lane.lowRead) ? lane.add[0]->gtGetOp2() : lane.add[0]->gtGetOp1();
         lane.highOutStore = storeOf(lane.adc[0]);
         lane.addCount     = 1;
 
@@ -14755,10 +14753,9 @@ bool Lowering::TryLowerMultiplyCarryRows()
             }
             continue;
         }
-        lane.add[1] = partialUse.User();
-        lane.adc[1] = high1Use.User();
-        lane.other[1] =
-            (lane.add[1]->gtGetOp1() == partialRead) ? lane.add[1]->gtGetOp2() : lane.add[1]->gtGetOp1();
+        lane.add[1]   = partialUse.User();
+        lane.adc[1]   = high1Use.User();
+        lane.other[1] = (lane.add[1]->gtGetOp1() == partialRead) ? lane.add[1]->gtGetOp2() : lane.add[1]->gtGetOp1();
         lane.highOutStore = storeOf(lane.adc[1]);
         lane.addCount     = 2;
         if (lane.highOutStore == nullptr)
@@ -14775,17 +14772,17 @@ bool Lowering::TryLowerMultiplyCarryRows()
         size_t end = start + 1;
         for (; end < lanes.size(); end++)
         {
-            Lane&    prev  = lanes[end - 1];
-            Lane&    lane  = lanes[end];
+            Lane& prev = lanes[end - 1];
+            Lane& lane = lanes[end];
             // A bare lane passes its raw high word, whose value the rewrite keeps.
             GenTree* carry  = (prev.addCount == 0) ? nullptr : singleReader(prev.highOutStore);
             unsigned addend = BAD_VAR_NUM;
             for (unsigned i = 0; i < lane.addCount; i++)
             {
                 GenTree* other = lane.other[i];
-                if ((prev.addCount == 0) ? ((other->AsLclVar()->GetLclNum() == prev.highLocal) &&
-                                            (pos(other) > pos(prev.productStore)))
-                                         : (other == carry))
+                if ((prev.addCount == 0)
+                        ? ((other->AsLclVar()->GetLclNum() == prev.highLocal) && (pos(other) > pos(prev.productStore)))
+                        : (other == carry))
                 {
                     addend = i;
                     carry  = other;
@@ -14869,8 +14866,8 @@ bool Lowering::TryLowerMultiplyCarryRows()
             {
                 for (unsigned j = 0; j < lanes[i].addCount; j++)
                 {
-                    matched |= (node == lanes[i].add[j]) || (node == lanes[i].adc[j]) ||
-                               (node == lanes[i].adc[j]->gtGetOp2());
+                    matched |=
+                        (node == lanes[i].add[j]) || (node == lanes[i].adc[j]) || (node == lanes[i].adc[j]->gtGetOp2());
                 }
             }
             if (matched || IsCarryFlagsCrossing(node) ||
@@ -14879,8 +14876,7 @@ bool Lowering::TryLowerMultiplyCarryRows()
             {
                 continue;
             }
-            if (node->OperIs(GT_HWINTRINSIC) &&
-                (node->AsHWIntrinsic()->GetHWIntrinsicId() == NI_X86Base_X64_BigMul) &&
+            if (node->OperIs(GT_HWINTRINSIC) && (node->AsHWIntrinsic()->GetHWIntrinsicId() == NI_X86Base_X64_BigMul) &&
                 (node->AsHWIntrinsic()->GetSimdBaseType() == TYP_ULONG))
             {
                 // Every unsigned product inside the row becomes a flags-preserving MULX.
@@ -14902,8 +14898,8 @@ bool Lowering::TryLowerMultiplyCarryRows()
             continue;
         }
 
-        JITDUMP("Keeping %s multiply-accumulate row of %u lanes in flags in " FMT_BB "\n",
-                single ? "single" : "dual", (unsigned)(last - first + 1), m_block->bbNum);
+        JITDUMP("Keeping %s multiply-accumulate row of %u lanes in flags in " FMT_BB "\n", single ? "single" : "dual",
+                (unsigned)(last - first + 1), m_block->bbNum);
         changed = true;
         BlockRange().InsertBefore(seed, new (m_compiler, GT_ADX_SEED) GenTree(GT_ADX_SEED, TYP_VOID));
         for (GenTree* node = seed; node != lastAdc; node = node->gtNext)
@@ -14916,8 +14912,8 @@ bool Lowering::TryLowerMultiplyCarryRows()
         // Containment may have swapped the commutative BigMul operands and
         // put a row constant in RDX. Prefer the invariant multiplier common
         // to all lanes as MULX's implicit operand, so it stays in RDX.
-        unsigned multiplierLocal = BAD_VAR_NUM;
-        GenTreeHWIntrinsic* firstProduct = lanes[first].product->AsHWIntrinsic();
+        unsigned            multiplierLocal = BAD_VAR_NUM;
+        GenTreeHWIntrinsic* firstProduct    = lanes[first].product->AsHWIntrinsic();
         for (unsigned operandIndex = 1; operandIndex <= 2; operandIndex++)
         {
             GenTree* operand = firstProduct->Op(operandIndex);
@@ -14927,16 +14923,15 @@ bool Lowering::TryLowerMultiplyCarryRows()
             {
                 continue;
             }
-            unsigned local = operand->AsLclVar()->GetLclNum();
-            bool shared = true;
+            unsigned local  = operand->AsLclVar()->GetLclNum();
+            bool     shared = true;
             for (size_t i = first + 1; i <= last; i++)
             {
                 GenTreeHWIntrinsic* product = lanes[i].product->AsHWIntrinsic();
-                bool found = false;
+                bool                found   = false;
                 for (unsigned j = 1; j <= 2; j++)
                 {
-                    found |= product->Op(j)->OperIs(GT_LCL_VAR) &&
-                             product->Op(j)->AsLclVar()->GetLclNum() == local;
+                    found |= product->Op(j)->OperIs(GT_LCL_VAR) && product->Op(j)->AsLclVar()->GetLclNum() == local;
                 }
                 shared &= found;
             }
@@ -14953,8 +14948,7 @@ bool Lowering::TryLowerMultiplyCarryRows()
             if (multiplierLocal != BAD_VAR_NUM)
             {
                 GenTreeHWIntrinsic* product = lane.product->AsHWIntrinsic();
-                if (product->Op(2)->OperIs(GT_LCL_VAR) &&
-                    product->Op(2)->AsLclVar()->GetLclNum() == multiplierLocal)
+                if (product->Op(2)->OperIs(GT_LCL_VAR) && product->Op(2)->AsLclVar()->GetLclNum() == multiplierLocal)
                 {
                     std::swap(product->Op(1), product->Op(2));
                 }
@@ -14980,10 +14974,10 @@ bool Lowering::TryLowerMultiplyCarryRows()
             else
             {
                 // (c + t + CF) + lo + OF, with both addends read at the first addition.
-                GenTree* carry   = (i == first) ? lane.other[1] : lane.carry;
-                GenTree* dest    = (i == first) ? lane.other[0] : lane.dest;
-                GenTree* partial = (lane.add[1]->gtGetOp1() == lane.other[1]) ? lane.add[1]->gtGetOp2()
-                                                                               : lane.add[1]->gtGetOp1();
+                GenTree* carry = (i == first) ? lane.other[1] : lane.carry;
+                GenTree* dest  = (i == first) ? lane.other[0] : lane.dest;
+                GenTree* partial =
+                    (lane.add[1]->gtGetOp1() == lane.other[1]) ? lane.add[1]->gtGetOp2() : lane.add[1]->gtGetOp1();
                 for (GenTree* addend : {carry, dest})
                 {
                     BlockRange().Remove(addend);
@@ -15048,7 +15042,7 @@ void Lowering::LowerMaskSelects()
     }
     for (BasicBlock* block : m_compiler->Blocks())
     {
-        m_block = block;
+        m_block      = block;
         bool hasMask = false;
         for (GenTree* node : BlockRange())
         {
@@ -15070,7 +15064,7 @@ void Lowering::LowerMaskSelects()
 //
 bool Lowering::TryLowerMaskSelect()
 {
-    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, GenTree*>        NodeToNodeMap;
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, GenTree*>             NodeToNodeMap;
     typedef JitHashTable<unsigned, JitSmallPrimitiveKeyFuncs<unsigned>, GenTree*> LocalToNodeMap;
     CompAllocator alloc = m_compiler->getAllocator(CMK_Lower);
 
@@ -15199,8 +15193,8 @@ bool Lowering::TryLowerMaskSelect()
             if (valid)
             {
                 select.outer = andUse.User();
-                select.t     = (select.outer->gtGetOp1() == select.andNode) ? select.outer->gtGetOp2()
-                                                                            : select.outer->gtGetOp1();
+                select.t =
+                    (select.outer->gtGetOp1() == select.andNode) ? select.outer->gtGetOp2() : select.outer->gtGetOp1();
                 valid = select.t->OperIs(GT_LCL_VAR);
             }
             for (unsigned i = 0; valid && (i < 2); i++)
@@ -15273,7 +15267,7 @@ bool Lowering::TryLowerMaskSelect()
         };
 
         // Only nodes that leave the flags alone may remain between the producer and the last select.
-        unsigned remaining  = (unsigned)selects.size();
+        unsigned remaining = (unsigned)selects.size();
         for (GenTree* node = producer->gtNext; valid && (remaining != 0); node = node->gtNext)
         {
             bool isSelect = false;
@@ -16033,8 +16027,8 @@ bool Lowering::LowerFullAdders()
                 {
                     continue;
                 }
-                unsigned outputLocal = use.User()->AsLclVar()->GetLclNum();
-                LclVarDsc* outputDsc = m_compiler->lvaGetDesc(outputLocal);
+                unsigned   outputLocal = use.User()->AsLclVar()->GetLclNum();
+                LclVarDsc* outputDsc   = m_compiler->lvaGetDesc(outputLocal);
                 if (!outputDsc->lvTracked || outputDsc->IsAddressExposed() || outputDsc->lvIsParam)
                 {
                     continue;
@@ -16050,7 +16044,7 @@ bool Lowering::LowerFullAdders()
                     // Copy propagation can give the first carry a different local
                     // from subsequent full-adder outputs. Accept this seed only
                     // when every definition of its input is independently a bit.
-                    bool seeded = false;
+                    bool seeded   = false;
                     bool bitInput = true;
                     for (BasicBlock* definitionBlock : m_compiler->Blocks())
                     {
@@ -16072,8 +16066,8 @@ bool Lowering::LowerFullAdders()
                             {
                                 bit = bit->gtGetOp1();
                             }
-                            bool isBit = bit->IsIntegralConst(0) || bit->IsIntegralConst(1) ||
-                                         bit->OperIs(GT_SETCC) || bit->OperIsCompare();
+                            bool isBit = bit->IsIntegralConst(0) || bit->IsIntegralConst(1) || bit->OperIs(GT_SETCC) ||
+                                         bit->OperIsCompare();
                             seeded |= isBit;
                             bitInput &= isBit;
                         }
@@ -16322,8 +16316,7 @@ bool Lowering::IsCarryFlagsCrossing(GenTree* node)
     if (node->OperIs(GT_HWINTRINSIC))
     {
         GenTreeHWIntrinsic* product = node->AsHWIntrinsic();
-        if (product->GetHWIntrinsicId() == NI_X86Base_X64_BigMul &&
-            product->GetSimdBaseType() == TYP_ULONG)
+        if (product->GetHWIntrinsicId() == NI_X86Base_X64_BigMul && product->GetSimdBaseType() == TYP_ULONG)
         {
             if ((node->gtFlags & GTF_HW_MULX) != 0)
             {
@@ -16345,13 +16338,12 @@ bool Lowering::IsCarryFlagsCrossing(GenTree* node)
             }
         }
     }
-    if (node->OperIs(GT_STORE_LCL_VAR) && node->TypeIs(TYP_STRUCT) &&
-        node->gtGetOp1()->OperIs(GT_HWINTRINSIC) && (node->gtGetOp1()->gtFlags & GTF_HW_MULX) != 0)
+    if (node->OperIs(GT_STORE_LCL_VAR) && node->TypeIs(TYP_STRUCT) && node->gtGetOp1()->OperIs(GT_HWINTRINSIC) &&
+        (node->gtGetOp1()->gtFlags & GTF_HW_MULX) != 0)
     {
         // The multi-register product's stores/copies preserve the flags too.
         GenTreeHWIntrinsic* product = node->gtGetOp1()->AsHWIntrinsic();
-        return product->GetHWIntrinsicId() == NI_X86Base_X64_BigMul &&
-               product->GetSimdBaseType() == TYP_ULONG;
+        return product->GetHWIntrinsicId() == NI_X86Base_X64_BigMul && product->GetSimdBaseType() == TYP_ULONG;
     }
     if (node->isContained())
     {
@@ -16511,7 +16503,7 @@ void Lowering::LowerCarryChains()
                     // Hoist only a closed invariant mask tree before the producer;
                     // SideEffectSet checks definitions, memory and exception order.
                     GenTree* hoistBefore = producer;
-                    unsigned rootBudget = 64;
+                    unsigned rootBudget  = 64;
                     while (hoistBefore->OperConsumesFlags() && rootBudget != 0)
                     {
                         GenTree* previous = hoistBefore->gtPrev;
@@ -16921,6 +16913,14 @@ void Lowering::TryLowerCarryLoop(
         BlockRange().Remove(definition);
     };
     forward(sum, sum->gtGetOp2(), GT_IND);
+#ifdef TARGET_AMD64
+    // Reconsidering containment after forwarding can retain a reg-optional
+    // annotation from the first containment check of this full adder. The
+    // register-optional heuristic requires fresh operands (notably under
+    // REVERSE_FLAG and SPLIT_TREES_REMOVE_COMMAS stress).
+    sum->gtGetOp1()->ClearRegOptional();
+    sum->gtGetOp2()->ClearRegOptional();
+#endif
     ContainCheckBinary(sum->AsOp());
     for (GenTree* node : BlockRange())
     {
@@ -17192,7 +17192,7 @@ bool Lowering::TryLowerAddCarry(GenTreeOp* add)
         // Moving flag-writing operand expressions immediately before ADC/SBB
         // would destroy its incoming carry. Hoist before the chain's root.
         GenTree* availableAt = producer;
-        unsigned rootBudget = 64;
+        unsigned rootBudget  = 64;
         while (availableAt->OperConsumesFlags() && rootBudget != 0)
         {
             GenTree* previous = availableAt->gtPrev;
@@ -17208,7 +17208,7 @@ bool Lowering::TryLowerAddCarry(GenTreeOp* add)
             rootBudget--;
         }
         GenTree* moveStart[2] = {};
-        bool keepPosition = false;
+        bool     keepPosition = false;
         if (availableAt->OperConsumesFlags() || rootBudget == 0 ||
             !IsCarryOperandAvailable(operands[0], availableAt, &moveStart[0]) ||
             (combine && !IsCarryOperandAvailable(operands[1], availableAt, &moveStart[1])))
@@ -17218,7 +17218,7 @@ bool Lowering::TryLowerAddCarry(GenTreeOp* add)
             // load across that store, provided every surviving node preserves
             // flags. The nested ADD/SUB is removed when forming the full adder.
             GenTree* crossing = producer->gtNext;
-            unsigned scan = 64;
+            unsigned scan     = 64;
             for (; crossing != nullptr && crossing != add && scan != 0; crossing = crossing->gtNext, scan--)
             {
                 if (crossing == carry || crossing == cast || crossing == store || crossing == value ||
@@ -17236,7 +17236,7 @@ bool Lowering::TryLowerAddCarry(GenTreeOp* add)
                 continue;
             }
             moveStart[0] = moveStart[1] = nullptr;
-            keepPosition = true;
+            keepPosition                = true;
         }
 
         // Inserting ADC/SBB changes flags. No later consumer may observe the
