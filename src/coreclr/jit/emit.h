@@ -3163,11 +3163,12 @@ private:
         assert(emitCanPeepholeLastIns());
 
 #if EMIT_BACKWARDS_NAVIGATION
-        insGroup*  curInsIG;
-        instrDesc* id;
-
-        if (!emitGetLastIns(&curInsIG, &id))
-            return;
+        // Prolog/epilog emission revisits groups before emitIGlast, and the
+        // current instruction can still be in the unsaved emission buffer.
+        // Start at the instruction vetted by emitCanPeepholeLastIns, rather
+        // than at the last group in the whole function.
+        insGroup*  curInsIG = emitLastInsIG;
+        instrDesc* id       = emitLastIns;
 
         for (unsigned i = 0; i < EMIT_MAX_PEEPHOLE_INS_COUNT; i++)
         {

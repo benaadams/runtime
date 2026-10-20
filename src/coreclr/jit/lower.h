@@ -176,6 +176,9 @@ private:
     bool        TryLowerAddCarry(GenTreeOp* add);
     bool        LowerFullAdders();
     void        LowerCarryChains();
+    void        LowerMaskSelects();
+    bool        TryLowerMaskSelect();
+    bool        TryLowerMaskedXorSwap();
 #ifdef TARGET_AMD64
     void     ReplaceCarryAddressAdd(GenTree* add);
     GenTree* FindMultiplyCarryStore(GenTree* read, bool loopCarry = false);
@@ -183,12 +186,12 @@ private:
     bool     TryLowerMultiplyCarryLoop();
     bool     TryLowerMultiplyCarryChain();
     bool     TryLowerMultiplyCarryRows();
-    void     LowerMaskSelects();
-    bool     TryLowerMaskSelect();
     void     TryLowerMultiplyCarryBackedge();
     void     LowerMultiplyCarryMultiplier();
     void     LowerMultiplyCarryLoads();
 #else
+    void LowerArm64MultiplyCarryRows();
+    bool TryLowerArm64MultiplyCarryRows();
     void LowerArm64MultiplyCarryLoops();
     void TryLowerArm64MultiplyCarryLoop();
 #endif
@@ -196,6 +199,9 @@ private:
         GenTree* sum, GenTree* restore, GenTree* cc, GenTree* cast, GenTree* store, unsigned carryLocal);
     bool IsCarryOperandAvailable(GenTree* operand, GenTree* producer, GenTree** moveStart);
     bool IsCarryFlagsCrossing(GenTree* node);
+#ifdef TARGET_ARM64
+    bool AreFlagsLiveBefore(GenTree* insertion);
+#endif
 #endif
     GenTree* LowerJTrue(GenTreeOp* jtrue);
 #ifdef TARGET_RISCV64
@@ -699,8 +705,16 @@ private:
     bool        m_hasAddCarry          = false;
     BasicBlock* m_lastSubtractionBlock = nullptr;
     unsigned    m_carryLocalScanBudget = 262144; // Node/block budget for current-IR dead-on-exit proofs.
-    unsigned    m_carryUseScanBudget   = 65536;  // Extra node visits beyond the bounded local carry-use scans.
-    unsigned    m_maskSelectScanBudget = 65536; // Node visits for the block rescans of LowerMaskSelects.
+#ifdef TARGET_ARM64
+    unsigned m_carryUseScanBudget = 1048576; // Unrolled Montgomery kernels have many single-use carry temporaries.
+#else
+    unsigned m_carryUseScanBudget = 65536; // Extra node visits beyond the bounded local carry-use scans.
+#endif
+    unsigned m_maskSelectScanBudget = 65536; // Node visits for the block rescans of LowerMaskSelects.
+#ifdef TARGET_ARM64
+    unsigned m_arm64RowScanBudget     = 65536; // Reference-link rebuilds after ARM64 row rewrites.
+    bool     m_arm64CarryPostLowering = false; // Only retain distant flags after all block nodes are lowered.
+#endif
 #endif
 
 #ifdef FEATURE_FIXED_OUT_ARGS
